@@ -43,6 +43,14 @@ class MessageBusEventHandler(WebSocketHandler):
                                        self.rate_limit_debit_max,
                                        self.rate_limit_file_max)
         self._purge_programmee = False
+        # 202home : close() amorce la fermeture WebSocket mais ne coupe pas
+        # net le flux de trames DÉJÀ reçues par Tornado avant que la
+        # fermeture aboutisse — on_message() continue d'être appelé pour
+        # elles. Constaté en vrai : plus de 1500 avertissements de suite
+        # pour UNE seule connexion fautive, close() rappelé à chaque fois.
+        # Ce drapeau rend le kick idempotent : la décision est prise une
+        # fois, tout le reste du sursis est ignoré sans bruit.
+        self._fermeture_amorcee = False
 
     def on(self, event_name, handler):
         self.emitter.on(event_name, handler)
@@ -82,6 +90,8 @@ class MessageBusEventHandler(WebSocketHandler):
         # cette version). Un message illisible (type_ absent) n'est jamais
         # throttlé : on ne peut pas le grouper par type, et le comportement
         # d'origine (transmis tel quel) reste le repli le plus sûr.
+        if self._fermeture_amorcee:
+            return
         type_ = self._type_du_message(message)
         if type_ is not None:
             maintenant = time.monotonic()
@@ -92,6 +102,7 @@ class MessageBusEventHandler(WebSocketHandler):
                         "messagebus : débit excessif sur '%s' depuis %s — "
                         "connexion fermée (%d messages en file)",
                         type_, self.request.remote_ip, self._limiteur.taille_file())
+                    self._fermeture_amorcee = True
                     self.close(code=1008, reason=f"débit excessif : {type_}")
                     return
                 self._programmer_purge()
