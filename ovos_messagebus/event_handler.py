@@ -13,7 +13,10 @@
 # limitations under the License.
 #
 """Define the web socket event handler for the message bus."""
+import hmac
+import re
 import json
+import os
 import sys
 import time
 import traceback
@@ -24,11 +27,40 @@ from ovos_config import Configuration
 from ovos_utils.log import LOG
 from pyee import EventEmitter
 from tornado.ioloop import IOLoop
+from tornado.web import HTTPError
 from tornado.websocket import WebSocketHandler
 
 from ovos_messagebus.limiteur_debit import LimiteurDebit
 
 client_connections = []
+
+# 202home : jeton du canal INTERNE ws_proxy.py -> coeur — voir mycroft::jetonCoeurBridge() côté plugin
+# Jeedom, et le même mécanisme dans ovos_microphone_plugin_navigateur/hp_navigateur. RELU À CHAQUE
+# CONNEXION, jamais mis en cache : une rotation prend effet immédiatement, sans redémarrer ce démon.
+# N'authentifie QUE le segment ws_proxy.py -> coeur (ce port n'est jamais publié sur l'hôte, voir
+# docker-compose.yml) — les clients internes de coeur (skills, GUI locale) ne passent jamais par ici.
+_JETON_COEUR_FICHIER = os.environ.get(
+    "MYCROFT_COEUR_BRIDGE_JETON_FICHIER", "/etc/202home/coeur-bridge/jeton")
+
+
+# SÉCURITÉ — À GARDER (doc/securite.md) :
+# jeton relu à chaque connexion, temps constant, ÉCHEC FERMÉ. Aucune connexion sans jeton valide.
+def _jeton_valide(presente: str) -> bool:
+    try:
+        attendu = open(_JETON_COEUR_FICHIER, encoding="utf-8").read().strip()
+    except OSError:
+        return False           # ÉCHEC FERMÉ : fichier absent/illisible -> aucune connexion acceptée
+    return bool(attendu) and hmac.compare_digest(attendu.encode("utf-8"), presente.encode("utf-8"))
+
+def _jeton_de(requete) -> str:
+    """Le jeton PRÉSENTÉ : en-tête `Authorization: Bearer`, sinon cookie `mycroft_jeton`. JAMAIS l'URL.
+    SÉCURITÉ — À GARDER (doc/securite.md) : aucun secret dans une URL (`?jeton=` n'est plus lu)."""
+    m = re.match(r"Bearer\s+(\S+)\s*$", requete.headers.get("Authorization", ""), re.I)
+    if m:
+        return m.group(1)
+    morceau = requete.cookies.get("mycroft_jeton")
+    return morceau.value if morceau is not None else ""
+
 
 
 class MessageBusEventHandler(WebSocketHandler):
@@ -172,6 +204,18 @@ class MessageBusEventHandler(WebSocketHandler):
 
         for client in client_connections:
             client.write_message(message)
+
+    def prepare(self):
+        # 202home : contrairement à mic/hp-navigateur, CE port sert aussi les skills/GUI de `coeur`
+        # elles-mêmes — dans le MÊME conteneur, jamais à travers ws_proxy.py. Leur trafic arrive donc
+        # TOUJOURS en loopback véritable (127.0.0.1/::1, même espace réseau que le processus messagebus) ;
+        # celui de ws_proxy.py (autre conteneur en banc de dev, autre hôte en production) jamais. Exiger le
+        # jeton PARTOUT romprait toute communication interne, dont aucun client interne ne le présente. On
+        # ne le vérifie donc que pour une origine NON locale — le seul segment que ce projet doit
+        # authentifier ici, ws_proxy.py -> coeur, franchit toujours une frontière de conteneur/hôte.
+        if self.request.remote_ip not in ("127.0.0.1", "::1"):
+            if not _jeton_valide(_jeton_de(self.request)):
+                raise HTTPError(403, reason="jeton coeur refusé")
 
     def open(self):
         self.write_message(Message("connected",

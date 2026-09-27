@@ -39,11 +39,16 @@ def load_message_bus_config(**overrides):
         LOG.error('No websocket configs found ({})'.format(repr(ke)))
         raise
     else:
+        # 202home : `websocket_configs.get('ssl')`, PAS `config.get('ssl')` (le bug upstream d'origine) —
+        # ovos_bus_client/conf.py (le CLIENT, non modifié ici) lit bien `websocket.ssl`, à l'intérieur du
+        # bloc déjà narrowé ; le lire à la RACINE ici les désaccordait silencieusement : poser
+        # `websocket.ssl: true` dans mycroft.conf (entree.sh) ne changeait rien côté serveur, qui
+        # continuait de servir en ws:// nu malgré ce réglage.
         mb_config = MessageBusConfig(
             host=overrides.get('host') or websocket_configs.get('host'),
             port=overrides.get('port') or websocket_configs.get('port'),
             route=overrides.get('route') or websocket_configs.get('route'),
-            ssl=overrides.get('ssl') or config.get('ssl')
+            ssl=overrides.get('ssl') if 'ssl' in overrides else websocket_configs.get('ssl', False)
         )
         if not all([mb_config.host, mb_config.port, mb_config.route]):
             error_msg = 'Missing one or more websocket configs'
