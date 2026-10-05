@@ -73,7 +73,9 @@ class MessageBusEventHandler(WebSocketHandler):
         # _purger() se reprogramme lui-même tant que la file n'est pas vide.
         self._limiteur = LimiteurDebit(self.rate_limit_delai_type,
                                        self.rate_limit_debit_max,
-                                       self.rate_limit_file_max)
+                                       self.rate_limit_file_max,
+                                       self.rate_limit_exemptions,
+                                       self.rate_limit_alerte_exemptes)
         self._purge_programmee = False
         # 202home : close() amorce la fermeture WebSocket mais ne coupe pas
         # net le flux de trames DÉJÀ reçues par Tornado avant que la
@@ -116,6 +118,16 @@ class MessageBusEventHandler(WebSocketHandler):
     def rate_limit_file_max(self) -> int:
         return Configuration().get("websocket", {}).get("rate_limit_file_max", 200)
 
+    # Les préfixes de types jamais retardés (le relais MQTT porte la voix) et
+    # le nombre par seconde au-delà duquel on les signale quand même.
+    @property
+    def rate_limit_exemptions(self) -> list:
+        return Configuration().get("websocket", {}).get("rate_limit_exemptions", ["cluster_mqtt.relais."])
+
+    @property
+    def rate_limit_alerte_exemptes(self) -> int:
+        return Configuration().get("websocket", {}).get("rate_limit_alerte_exemptes", 200)
+
     def on_message(self, message):
         # 202home : anti-déluge AVANT toute diffusion — le type doit être lu
         # même hors du mode `filter` (qui, seul, désérialisait déjà avant
@@ -127,7 +139,13 @@ class MessageBusEventHandler(WebSocketHandler):
         type_ = self._type_du_message(message)
         if type_ is not None:
             maintenant = time.monotonic()
-            if not self._limiteur.autoriser(type_, maintenant):
+            if self._limiteur.exempte(type_):
+                if self._limiteur.compter_exempte(maintenant):
+                    LOG.warning(
+                        "messagebus : plus de %d messages exemptés par seconde "
+                        "depuis %s (dernier : '%s') — jamais retardés, à surveiller",
+                        self._limiteur.alerte_exemptes, self.request.remote_ip, type_)
+            elif not self._limiteur.autoriser(type_, maintenant):
                 self._limiteur.mettre_en_file(type_, message)
                 if self._limiteur.sature():
                     LOG.warning(

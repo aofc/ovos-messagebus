@@ -84,6 +84,37 @@ def executer():
     l.mettre_en_file("x", "x-de-trop")
     verifier("un message de plus que FILE_MAX : saturée", l.sature(), True)
 
+    # --- le relais MQTT (la voix) est exempté : jamais retardé ---------------
+    l = LimiteurDebit(delai_meme_type=0.2, debit_max=10, file_max=50)
+    verifier("le préfixe du relais est exempté par défaut",
+             [l.exempte("cluster_mqtt.relais.publier"), l.exempte("cluster_mqtt.relais.message.phal"),
+              l.exempte("cluster_mqtt.declare"), l.exempte("register_vocab")], [True, True, False, False])
+    rafale = [l.autoriser("cluster_mqtt.relais.publier", 0.001 * i) for i in range(30)]
+    verifier("30 publications du relais en 30 ms : toutes immédiates", rafale, [True] * 30)
+    verifier("… aucune en file", l.file_pleine(), False)
+    verifier("… et elles ne comptent pas dans le débit global : 10 autres types passent",
+             [l.autoriser(f"autre-{i}", 0.03) for i in range(10)], [True] * 10)
+    verifier("… le 11e, lui, est toujours retenu (le garde-fou reste)", l.autoriser("autre-10", 0.03), False)
+    verifier("un type NON exempté reste limité à un message par 200 ms",
+             [l.autoriser("x", 2.0), l.autoriser("x", 2.05)], [True, False])
+    l = LimiteurDebit(exemptions=())
+    verifier("sans exemption configurée, le relais est limité comme les autres",
+             [l.autoriser("cluster_mqtt.relais.publier", 0.0), l.autoriser("cluster_mqtt.relais.publier", 0.01)],
+             [True, False])
+    l = LimiteurDebit(exemptions=["voix."])
+    verifier("les préfixes sont configurables", [l.exempte("voix.x"), l.exempte("cluster_mqtt.relais.publier")],
+             [True, False])
+
+    # --- un déluge de messages exemptés est SIGNALÉ, une fois par rafale -------
+    l = LimiteurDebit(alerte_exemptes=5)
+    alertes = [l.compter_exempte(0.01 * i) for i in range(12)]
+    verifier("l'alerte tombe au 6e message de la seconde, UNE seule fois",
+             alertes, [False] * 5 + [True] + [False] * 6)
+    verifier("après une seconde calme, le débit est redescendu : pas d'alerte",
+             l.compter_exempte(5.0), False)
+    alertes = [l.compter_exempte(6.0 + 0.01 * i) for i in range(6)]
+    verifier("une NOUVELLE rafale est signalée de nouveau", alertes, [False] * 5 + [True])
+
     print(f"\n  {len(passes)} contrôles passés" +
           (f", {len(echecs)} échec(s) : " + "; ".join(echecs) if echecs else "."))
     return not echecs

@@ -19,16 +19,33 @@ normale (le chargement d'un skill, par exemple, envoie des centaines de
 `register_vocab` d'affilée, mais tous DIFFÉRENTS — jamais bloqué par la
 DEUXIÈME borne ci-dessous, seulement lissé par la première) : c'est un
 client fautif, à l'appelant de fermer la connexion (voir sature()).
+
+EXEMPTIONS : les types qui commencent par un de ces préfixes ne sont JAMAIS
+retardés ni comptés dans les deux bornes. C'est le relais MQTT
+(`cluster_mqtt.relais.*`) : il porte la voix (STT, TTS, LLM par Bruno) en
+plusieurs messages de même type dans la même fraction de seconde — l'accusé,
+les morceaux, la fin — et 200 ms par message rendaient la voix inutilisable
+(constaté sur le banc : premier son en 0,11 s sans la règle). La règle reste
+un GARDE-FOU contre les déluges, pas une régulation nécessaire en temps
+normal : un type exempté est seulement SURVEILLÉ (voir compter_exempte()).
 """
 from collections import deque
 
 
 class LimiteurDebit:
 
-    def __init__(self, delai_meme_type=0.2, debit_max=10, file_max=200):
+    def __init__(self, delai_meme_type=0.2, debit_max=10, file_max=200,
+                 exemptions=("cluster_mqtt.relais.",), alerte_exemptes=200):
         self.delai_meme_type = delai_meme_type
         self.debit_max = debit_max
         self.file_max = file_max
+        self.exemptions = tuple(exemptions or ())
+        self.alerte_exemptes = alerte_exemptes
+        # Émissions exemptées de la dernière seconde (fenêtre glissante, comme
+        # _horodatages_recents), et si l'alerte a déjà été donnée pour la
+        # rafale en cours : une alerte par rafale, pas une par message.
+        self._exemptes_recents = deque()
+        self._alerte_donnee = False
         # type -> horodatage (time.monotonic()) de sa dernière émission.
         self._dernier_envoi_type = {}
         # Horodatages des émissions de la dernière seconde, PAS un simple
@@ -56,12 +73,33 @@ class LimiteurDebit:
         self._horodatages_recents.append(maintenant)
         self._dernier_envoi_type[type_] = maintenant
 
+    def exempte(self, type_) -> bool:
+        return any(type_.startswith(p) for p in self.exemptions)
+
+    def compter_exempte(self, maintenant) -> bool:
+        """Compte une émission exemptée ; True UNE fois, quand la dernière
+        seconde dépasse alerte_exemptes — à l'appelant de le journaliser.
+        Jamais de retard ni de fermeture : seulement débusquer la source."""
+        while self._exemptes_recents and maintenant - self._exemptes_recents[0] >= 1.0:
+            self._exemptes_recents.popleft()
+        self._exemptes_recents.append(maintenant)
+        if len(self._exemptes_recents) <= self.alerte_exemptes:
+            self._alerte_donnee = False
+            return False
+        if self._alerte_donnee:
+            return False
+        self._alerte_donnee = True
+        return True
+
     def autoriser(self, type_, maintenant) -> bool:
         """True si CE message peut partir immédiatement — et dans ce cas
         SEULEMENT, l'émission est enregistrée : l'appelant n'a rien d'autre
         à tenir à jour. Faux si un message de même type est déjà en file :
         l'ORDRE d'arrivée par type doit être préservé, un nouveau message ne
-        double jamais ceux qui attendent déjà."""
+        double jamais ceux qui attendent déjà. Un type EXEMPTÉ part toujours,
+        sans rien enregistrer (voir compter_exempte())."""
+        if self.exempte(type_):
+            return True
         if any(t == type_ for t, _ in self._file):
             return False
         if self._sous_debit_global(maintenant) and self._type_disponible(type_, maintenant):
